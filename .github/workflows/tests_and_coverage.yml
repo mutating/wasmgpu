@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  push
+
+jobs:
+  build:
+
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14', '3.14t', '3.15']
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+          python-version: ${{ matrix.python-version }}
+          # Prerelease CPython ABIs can change; keep 3.15 aligned with current wheels.
+          allow-prereleases: true
+          check-latest: ${{ matrix.python-version == '3.15' }}
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        uv pip install --system -r requirements_dev.txt
+        uv pip install --system .
+
+    - name: Test Python validation and configuration (no GPU required)
+      shell: bash
+      run: |
+        coverage erase
+        coverage run -m pytest -m 'not gpu' --cache-clear
+        coverage combine
+        coverage report -m
+        coverage xml
+      # This report covers only tests that require no GPU. GPU execution and
+      # shader conformance are verified locally; these jobs do not claim that
+      # skipped GPU tests passed. Never enable a software execution fallback.
+
+    - name: Build source distribution and wheel
+      shell: bash
+      run: python -m build
+
+    - name: Upload Python-only coverage to Coveralls
+      if: runner.os == 'Linux' && matrix.python-version == '3.11'
+      env:
+        COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+      uses: coverallsapp/github-action@v2
+      with:
+        format: cobertura
+        file: coverage.xml
+        flag-name: python-only
+      continue-on-error: true
+
+    - name: Upload Python-only coverage report
+      if: runner.os == 'Linux' && matrix.python-version == '3.11'
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-only-coverage
+        path: coverage.xml
