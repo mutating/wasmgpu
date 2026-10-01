@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence, Tuple, TypeVar
 
-from ._errors import UnsupportedFeatureError, ValidationError
+from .errors import UnsupportedFeatureError, ValidationError
 
 T = TypeVar('T')
 Signature = Tuple[List[int], List[int]]
