@@ -18,3 +18,4 @@ CLAUDE.md
 mutants
 planning_features.md
 coverage.xml
+/tests/benchmark-results.json
