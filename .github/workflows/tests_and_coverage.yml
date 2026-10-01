@@ -49,6 +49,17 @@ jobs:
       shell: bash
       run: python -m build
 
+    - name: Upload Python-only coverage to Coveralls
+      if: runner.os == 'Linux' && matrix.python-version == '3.11'
+      env:
+        COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+      uses: coverallsapp/github-action@v2
+      with:
+        format: cobertura
+        file: coverage.xml
+        flag-name: python-only
+      continue-on-error: true
+
     - name: Upload Python-only coverage report
       if: runner.os == 'Linux' && matrix.python-version == '3.11'
       uses: actions/upload-artifact@v4
