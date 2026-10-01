@@ -13,3 +13,7 @@ cosmic-ray==8.3.15; python_version < '3.9'
 cosmic-ray==8.4.6; python_version >= '3.9'
 full_match==0.0.3
 locklib==0.0.22
+
+# Wasmtime is exclusively an independent test/benchmark reference.
+wasmtime==24.0.0; python_version < '3.9'
+wasmtime==49.0.0; python_version >= '3.9'
