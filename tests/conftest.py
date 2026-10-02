@@ -8,6 +8,24 @@ import wasmtime
 import wasmgpu
 
 
+def pytest_addoption(parser):
+    parser.addoption('--wasmgpu-execution', choices=['auto', 'compiled', 'interpreter'], default='auto',
+                     help='Default backend for the existing GPU conformance suite')
+
+
+@pytest.fixture(scope='session', autouse=True)
+def execution_mode(request):
+    mode = request.config.getoption('--wasmgpu-execution')
+    original = wasmgpu.Module.__init__
+    if mode != 'auto':
+        def configured(self, *args, **kwargs):
+            kwargs.setdefault('execution', mode)
+            original(self, *args, **kwargs)
+        wasmgpu.Module.__init__ = configured
+    yield
+    wasmgpu.Module.__init__ = original
+
+
 @pytest.fixture(scope='session')
 def engine():
     return wasmtime.Engine()
