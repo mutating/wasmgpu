@@ -13,13 +13,62 @@ with module.spawn(100_000) as instances:
 The runtime is implemented in this repository:
 
 ```text
-Python → wgpu-py → WGSL bytecode interpreter → wgpu-native → Metal / Vulkan / DX12
+Python → WASM validation / specialized WGSL → wgpu-py → Metal / Vulkan / DX12
 ```
 
 Python parses and validates the module, uploads initial state, dispatches work,
 and reads results. **All guest instructions and WASI services run on the GPU.**
 There is no CPU interpreter, CPU fallback, host WASI service loop, or dependency
 on Wasmtime in the installed package. Software GPU adapters are rejected.
+
+`execution="auto"` (the default) and `execution="compiled"` compile every
+supported function. The GPU program buffer contains metadata, jump tables and
+embedded data, **no instruction bytecode**. Execution shaders do not contain an
+opcode decoder or interpreter. `execution="interpreter"` explicitly selects the
+original GPU interpreter for differential testing; it is never an implicit fallback.
+A compilation failure is reported to the caller.
+
+The compiler divides the complete control-flow graph into bounded units, including
+functions larger than one unit. Native pipelines are compiled lazily when their
+continuations are reached. Limits of 256 lowered instructions and 64 KiB of
+generated source apply per unit, not per module; source overflow splits a unit
+instead of dropping functions. Large `br_table` targets are ordinary jump-table
+data. The driver compiles generated WGSL into native GPU code through wgpu.
+Python 3.8 / wgpu-py 0.18 uses a 16 KiB source cap per unit to reduce pressure
+on its older Metal compiler.
+
+Basic blocks keep intermediate values and modified locals in shader variables,
+spilling at continuations or traps. Calls and recursion use explicit GPU frames;
+there is no WGSL recursion. A dispatch loop selects **compiled block addresses**,
+never opcodes. When fuel or stack space cannot accommodate a whole block, an
+unrolled, statically compiled prefix preserves the exact trap and prior effects.
+It does not use the reference interpreter. Numeric implementations include software
+f64 and checked word loads. WASI services use a separate shared GPU pipeline,
+preserving the same embedded filesystem and operand stack. Python schedules
+pipelines without executing guest instructions or WASI operations.
+
+This architecture removes instruction interpretation, but transitions between
+compilation units require GPU scheduling and synchronization. Lazy native
+compilation can dominate a first invocation; measurements must separate it from
+execution. It does not establish a speedup over Wasmtime on CPython workloads.
+Use the independent development watchdog below for GPU experiments. Source-size
+limits alone do not guarantee driver memory usage or compilation time.
+
+```python
+module = wasmgpu.Module("worker.wasm", execution="compiled")
+with module.spawn(1000) as instances:
+    results = instances.call("process", inputs)
+    print(instances.last_call)  # phase timings and compiled/interpreted counts
+    instances.reset()          # fresh guest state, same allocated GPU buffers
+```
+
+`compile_functions=[...]` optionally prioritizes function indices when grouping
+units; every other function remains compiled. `compile_limit` (1–256) may lower
+the per-unit instruction budget. Parsed modules, generated code and GPU
+pipelines have bounded in-process caches. Instances share an immutable initial
+template; batched heap copies and per-instance random nonces are initialized on
+the GPU. `reset()` restores memory, globals, tables, files and descriptors and
+reruns the core WASM start function. It does not call a WASI command's `_start`.
 
 This is an experimental engine with the supported profile below, **not a
 complete implementation of every WebAssembly proposal or a security sandbox**.
@@ -78,6 +127,14 @@ transactions. A later call can reuse the instances. `proc_exit` raises a trap
 and records the per-instance code in `instances.exit_codes`. Explicitly close
 instances, preferably with a context manager, to release GPU buffers.
 
+`call(..., cancel=callback)` checks cancellation between GPU dispatches and raises
+`InterruptedError` if the callback returns true. Already completed effects persist.
+It cannot preempt a GPU command already submitted to the driver. `last_call`
+records lazy WGSL generation and native compilation, input preparation, upload,
+dispatch/completion synchronization, result readback and decoding separately,
+including counters up to cancellation. In compiled mode,
+`last_call.interpreted_instructions` is always zero.
+
 ## Embedded WASI Preview 1
 
 Files are **byte contents embedded into each instance's GPU filesystem**.
@@ -118,7 +175,7 @@ Other operating-system services have explicit virtual semantics:
 
 - Arguments/environment come from the embedded configuration.
 - All clocks use a per-instance virtual counter. It starts at `clock_epoch_ns`
-  (default 0) and advances by `clock_resolution_ns` (default 1) per interpreter
+  (default 0) and advances by `clock_resolution_ns` (default 1) per lowered WASM
   instruction. It never reads the host clock.
 - `poll_oneoff` reports ready virtual descriptors or advances virtual time to
   the earliest clock deadline, without sleeping on the host.
@@ -159,8 +216,8 @@ The current memory32 addressing implementation caps memory at 65,535 pages.
 | `table_elements` | up to 256, at least each declared minimum | Growth capacity per table, capped by each declared maximum |
 | `stack_size` | 256 | 64-bit value slots per instance, including locals |
 | `call_depth` | 64 | Nested call frames per instance |
-| `fuel` | 10,000,000 | Invocation budget; bulk work also consumes fuel |
-| `quantum` | 4096 | Interpreter instructions per dispatch before resumption |
+| `fuel` | 10,000,000 | Positive u64 invocation budget; bulk work also consumes fuel |
+| `quantum` | 4096 | Target instruction count per dispatch; compiled blocks may exceed it by at most 31 |
 | `batch_size` | device-derived | Instances per dispatch/buffer group |
 | `max_resident_bytes` | 512 MiB | Total resident buffer allocation budget |
 
@@ -170,6 +227,7 @@ are practical, but 100,000 workers with 1 MiB private memory require about 100 G
 before stacks/files. Excessive allocations fail before allocation. `resident_bytes`
 and `adapter_info` expose the allocation estimate and selected hardware.
 
+Compiled dispatches yield at basic-block boundaries; fuel remains exact.
 A dispatch quantum is not a real-time deadline. Large individual bulk operations
 and WASI operations can take longer than a scalar instruction. Tune resource
 budgets for trusted workloads; this runtime is not suitable for hostile modules.
@@ -177,20 +235,25 @@ budgets for trusted workloads; this runtime is not suitable for hostile modules.
 ## Verification and benchmarks
 
 ```sh
-venv/bin/python -m pytest tests -q           # hardware GPU required; absence fails
+venv/bin/python -m tests.gpu_guard --seconds 600 -- -m pytest tests -q
 venv/bin/python -m pytest tests -m 'not gpu' # parser/configuration/failure tests only
-WASMGPU_COVERAGE_BRANCH=true venv/bin/python -m coverage run -m pytest tests -q
+venv/bin/python -m tests.gpu_guard --seconds 600 -- -m pytest tests -q --wasmgpu-execution interpreter
+WASMGPU_COVERAGE_BRANCH=true venv/bin/python -m tests.gpu_guard --seconds 600 -- -m coverage run -m pytest tests -q
 venv/bin/python -m coverage combine
 venv/bin/python -m coverage report -m
 venv/bin/python -m tests.benchmark           # run alone, without concurrent GPU jobs
 venv/bin/python -m build
 ```
 
-All 358 tests passed on Apple M4 / Metal with Python 3.11, including 40 official
-spec suites plus API, numeric, WASI and compiled-code cases. This run covered
-100% of Python statements and branches; that percentage does not measure WGSL.
-Python 3.8/3.9/3.10 each passed 315 cases with their pinned GPU backend; Python 3.11
-also runs every official suite. Python 3.15rc2 passed the checks that require no GPU.
+The GPU suites run on Apple M4 / Metal with Python 3.11. The interpreter was also
+tested with Python 3.8/3.9/3.10 and their pinned GPU backends; native compilation is additionally checked on Python 3.8 / wgpu-py 0.18.
+The full suite on older backends still requires verification. `--wasmgpu-execution interpreter`
+reruns the existing suites against the reference GPU interpreter. Additional differential
+tests compare compiled and interpreted continuations, precise fuel exhaustion,
+WASI clocks, cancellation and reset. Large functions, cross-pipeline recursion,
+exported imports and large jump tables are covered explicitly. Tests forbid use
+of the interpreter and inspect shader sources and the uploaded program format.
+Python coverage does not measure WGSL.
 Tests compare scalar operations with Wasmtime, exercise 100,003 concurrent
 instances, and run actual compiled C and Rust fixtures with allocation, internal
 calls, f64, libc/Rust formatting and embedded files. Forty unmodified official
@@ -217,3 +280,43 @@ as configured for ordinary hosted runners. The Linux / Python 3.11 job uploads i
 coverage report to Coveralls with the `python-only` flag and saves it as a GitHub
 artifact. This report does not claim GPU tests have run. Full conformance and
 performance tests must be run locally with a hardware GPU.
+
+For real CPython WASI and the startup/pyflakes/mypy guest workloads used by
+throng, use [benchmark_cpython.py](tests/benchmark_cpython.py). Supply a runtime
+directory containing `python.wasm` and `lib/`; linter scenarios also take `--wheels`
+with pure-Python wheels (pyflakes 3.3.2, mypy 1.14.1 and dependencies). The benchmark
+embeds these bytes for GPU execution. Only the Wasmtime test oracle mounts host
+files. The guest scans `project/` instead of `.` to exclude its embedded runtime;
+throng scheduling, snapshotting and installation overhead are excluded.
+
+```sh
+venv/bin/python -m tests.benchmark_cpython --runtime /path/to/runtime --engine wasmtime --scenario startup --output /tmp/cpu.json
+venv/bin/python -m tests.gpu_guard --seconds 180 -- -m tests.benchmark_cpython --runtime /path/to/runtime --engine compiled --scenario startup --reference /tmp/cpu.json --output /tmp/gpu.json
+```
+
+Use `--engine interpreter` for the GPU reference, `--scenario pyflakes --wheels
+/path/to/wheels --files 1` for a linter workload, and `--files 100` for its larger
+corpus. `--reference` checks the runtime hash, arguments, exit code and captured
+streams. Failed or interrupted runs return a nonzero status and must not be
+counted as completed performance measurements. Reports are opt-in local files,
+not repository artifacts. Each invocation is one observation, not a statistical
+speedup claim; repeat under the same conditions before drawing conclusions.
+
+`--count-fuel` instruments Wasmtime to estimate a workload's size; its fuel units
+are not identical to this engine's lowered-instruction accounting, and the
+instrumentation changes CPU timings. Large linter workloads require explicit
+`--fuel` and `--call-seconds` settings as well as a matching watchdog deadline.
+Fuel and execution counters are u64 on the GPU; long invocations do not wrap at
+four billion instructions. Initial compilation, cached module loading and reset timings are reported
+separately. Lazy compilation during a call is reported in `metrics.codegen_seconds`
+and `metrics.compile_seconds`; `call_seconds` includes these phases, while
+`metrics.execute_seconds` excludes them.
+
+The watchdog runs separately from the worker. On macOS it accounts for physical
+memory of the worker and its own Metal compiler services, checks compilation and
+experiment deadlines, and terminates only those processes on a limit violation.
+Defaults are 1.5 GiB and 30 seconds per pipeline compilation. The benchmark also
+has a guest fuel budget and a call deadline. A driver cache hit can make a new
+process's pipeline creation faster; reported compilation times do not imply a
+cold Metal driver cache. Dispatch timings include completion-state readback;
+the output readback phase is measured separately.
