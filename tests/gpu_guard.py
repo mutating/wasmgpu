@@ -18,10 +18,11 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import ClassVar
 
 
 class Usage(ctypes.Structure):
-    _fields_ = [('uuid', ctypes.c_uint8 * 16), *[
+    _fields_: ClassVar[list[tuple[str, type]]] = [('uuid', ctypes.c_uint8 * 16), *[
         (name, ctypes.c_uint64) for name in (
             'user', 'system', 'idle', 'interrupts', 'pageins', 'wired',
             'resident', 'footprint', 'start', 'exit',
