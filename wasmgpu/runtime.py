@@ -38,7 +38,7 @@ from .types import (
 )
 from .wasi import WASI_IDS, Wasi, normalize_path
 
-_TRAPS = {
+_TRAPS: dict[int, str] = {
     1: 'unreachable', 2: 'out of bounds memory access', 3: 'out of bounds table access',
     4: 'integer divide by zero', 5: 'integer overflow', 6: 'invalid conversion to integer',
     7: 'stack exhausted', 8: 'fuel exhausted', 9: 'uninitialized element',
@@ -60,7 +60,8 @@ def _compile_phase(active: bool) -> None:
     if destination:
         path = Path(destination)
         temporary = path.with_suffix('.tmp')
-        temporary.write_text(json.dumps({'compiling': active, 'started': time.monotonic()}))
+        status: dict[str, bool | float] = {'compiling': active, 'started': time.monotonic()}
+        temporary.write_text(json.dumps(status))
         temporary.replace(path)
 
 

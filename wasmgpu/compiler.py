@@ -30,7 +30,9 @@ from .errors import ResourceLimitError
 TERMINATORS = {0, RETURN, 0x10, 0x11, JUMP, IF_ZERO, BRANCH, BRANCH_IF, BRANCH_TABLE}
 MAX_COMPILED_INSTRUCTIONS = 256
 MAX_GENERATED_BYTES = 65536
-TRAPPING_NUMERIC = {0x6D, 0x6E, 0x6F, 0x70, 0x7F, 0x80, 0x81, 0x82, *range(0xA8, 0xAC), *range(0xAE, 0xB2)}
+TRAPPING_NUMERIC: set[int] = {0x6D, 0x6E, 0x6F, 0x70, 0x7F, 0x80, 0x81, 0x82}
+TRAPPING_NUMERIC.update(range(0xA8, 0xAC))
+TRAPPING_NUMERIC.update(range(0xAE, 0xB2))
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,10 @@ def blocks(module: BinaryModule, function: Function, maximum: int = 32) -> list[
     return result
 
 
+def _interval_width(interval: tuple[int, int]) -> int:
+    return interval[1] - interval[0]
+
+
 def clusters(module: BinaryModule, function: Function, limit: int) -> list[list[Block]]:
     """Keep bounded loops together so a backedge need not launch another kernel."""
     body = blocks(module, function, min(32, limit))
@@ -123,7 +129,7 @@ def clusters(module: BinaryModule, function: Function, limit: int) -> list[list[
             if target < block.start:
                 intervals.add((positions[target], index + 1))
     joined: set[int] = set()
-    for interval in sorted(intervals, key=lambda pair: pair[1] - pair[0]):
+    for interval in sorted(intervals, key=_interval_width):
         start, end = interval
         if totals[end] - totals[start] > limit:
             continue
@@ -457,9 +463,13 @@ def compile_module(module: BinaryModule, functions: Iterable[int] | None = None,
         raise ResourceLimitError(f'compilation units are limited to 1..{MAX_COMPILED_INSTRUCTIONS} instructions')
     if source_limit < 256:
         raise ResourceLimitError('generated source limit is too small')
-    order = list(dict.fromkeys(functions or ()))
+    order: list[int] = []
+    selected: set[int] = set()
+    for index in functions or ():
+        if index not in selected:
+            selected.add(index)
+            order.append(index)
     if any(not 0 <= index < len(module.functions) for index in order):
         raise ValueError('compiled function index out of range')
-    selected = set(order)
     order.extend(index for index in range(len(module.functions)) if index not in selected)
     return CompiledModule(module, order, instruction_limit, source_limit)
