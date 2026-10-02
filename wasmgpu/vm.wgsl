@@ -6,8 +6,9 @@ struct Config {
 }
 struct State {
     pc: u32, sp: u32, base: u32, function_id: u32,
-    depth: u32, pages: u32, table_len: u32, status: u32,
-    trap: u32, fuel: u32, exit_code: u32, reserved: u32,
+    depth: u32, pages: u32, interpreted: u32, status: u32,
+    trap: u32, fuel: u32, exit_code: u32, compiled: u32,
+    fuel_high: u32, interpreted_high: u32, compiled_high: u32, padding: u32,
 }
 @group(0) @binding(0) var<storage, read> program: array<u32>;
 @group(0) @binding(1) var<uniform> config: Config;
@@ -19,6 +20,11 @@ struct State {
 var<private> lane: u32;
 var<private> vm: State;
 fn fail(code: u32) { vm.trap = code; vm.status = 2u; }
+fn fuel_available(amount: u32) -> bool { return vm.fuel_high != 0u || vm.fuel >= amount; }
+fn consume_fuel(amount: u32) {
+    if vm.fuel < amount { vm.fuel_high -= 1u; }
+    vm.fuel -= amount;
+}
 fn get_value(index: u32) -> vec2u { return values[index * config.count + lane]; }
 fn set_value(index: u32, value: vec2u) { values[index * config.count + lane] = value; }
 fn push(value: vec2u) {
@@ -57,10 +63,17 @@ fn invoke(function_id: u32) {
     if program[metadata + 5u] != 0u {
         let syscall = program[metadata + 5u];
         let answer = wasi_dispatch(syscall, base);
+        if vm.status == 5u { return; }
         vm.sp = base;
         if program[metadata + 2u] != 0u { push(vec2u(answer, 0u)); }
         return;
     }
+    invoke_native(function_id);
+}
+fn invoke_native(function_id: u32) {
+    let metadata = 16u + function_id * 8u;
+    let params = program[metadata + 1u]; let locals = program[metadata + 3u];
+    let base = vm.sp - params;
     if vm.depth >= config.frame_cap || base + locals > config.stack_cap { fail(7u); return; }
     frames[vm.depth * config.count + lane] = vec4u(vm.pc, vm.base, vm.function_id, base);
     vm.depth += 1u; vm.base = base; vm.function_id = function_id;
@@ -140,15 +153,11 @@ fn bulk_operation(op: u32, index: u32, other: u32) {
         }
     }
 }
-@compute @workgroup_size(64)
-fn run(@builtin(global_invocation_id) id: vec3u) {
-    lane = id.x;
-    if lane >= config.count { return; }
-    vm = states[lane];
-    if vm.status != 0u { return; }
-    for (var step = 0u; step < config.quantum; step += 1u) {
-        if vm.fuel == 0u { fail(8u); break; }
-        vm.fuel -= 1u;
+fn interpret_step() {
+        if !fuel_available(1u) { fail(8u); return; }
+        consume_fuel(1u);
+        vm.interpreted += 1u;
+        if vm.interpreted == 0u { vm.interpreted_high += 1u; }
         if program[12] != 0u {
             let clock = add64(vec2u(read_heap(config.fs_offset + 1u), read_heap(config.fs_offset + 2u)), vec2u(read_heap(config.fs_offset + 4u), 0u));
             write_heap(config.fs_offset + 1u, clock.x); write_heap(config.fs_offset + 2u, clock.y);
@@ -216,6 +225,15 @@ fn run(@builtin(global_invocation_id) id: vec3u) {
                 }
             }
         }
+}
+@compute @workgroup_size(64)
+fn run(@builtin(global_invocation_id) id: vec3u) {
+    lane = id.x;
+    if lane >= config.count { return; }
+    vm = states[lane];
+    if vm.status != 0u { return; }
+    for (var step = 0u; step < config.quantum; step += 1u) {
+        interpret_step();
         if vm.status != 0u { break; }
     }
     states[lane] = vm;
