@@ -26,8 +26,8 @@ fn fs_file(fd: u32) -> u32 {
 fn fs_inode(index: u32) -> u32 { return fs_entry(read_heap(fs_entry(index) + 5u)); }
 fn fs_right(fd: u32, right: u32) -> bool { return (read_heap(fs_descriptor(fd) + 4u) & right) == right; }
 fn fs_charge(amount: u32) -> bool {
-    if amount > vm.fuel { fail(8u); return false; }
-    vm.fuel -= amount; return true;
+    if !fuel_available(amount) { fail(8u); return false; }
+    consume_fuel(amount); return true;
 }
 fn fs_open_entry(index: u32) -> bool {
     for (var fd = 0u; fd < config.fs_fds; fd += 1u) { if fs_file(fd) == index { return true; } }

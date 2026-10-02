@@ -2,21 +2,34 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
+import json
 import os
 import struct
+import sys
 import threading
+import time
 from array import array
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence, Tuple, cast
+from typing import Callable, Iterable, Mapping, Sequence, Tuple, cast
 
-from .binary import F32, F64, I32, I64, BinaryModule
+from .binary import BRANCH_TABLE, F32, F64, I32, I64, BinaryModule
+from .compiler import (
+    MAX_COMPILED_INSTRUCTIONS,
+    CompiledModule,
+    compile_module,
+    vm_support,
+)
 from .errors import GPUUnavailableError, ResourceLimitError, Trap
 from .types import (
     AdapterInfo,
     Backend,
     Blob,
     Buffer,
+    Pipeline,
     RequestAdapter,
     RequestDevice,
     Result,
@@ -25,7 +38,7 @@ from .types import (
 )
 from .wasi import WASI_IDS, Wasi, normalize_path
 
-_TRAPS = {
+_TRAPS: dict[int, str] = {
     1: 'unreachable', 2: 'out of bounds memory access', 3: 'out of bounds table access',
     4: 'integer divide by zero', 5: 'integer overflow', 6: 'invalid conversion to integer',
     7: 'stack exhausted', 8: 'fuel exhausted', 9: 'uninitialized element',
@@ -33,6 +46,43 @@ _TRAPS = {
 }
 _CONTEXT: _Context | None = None
 _CONTEXT_LOCK = threading.Lock()
+_MODULE_CACHE: OrderedDict[bytes, tuple[BinaryModule, array[int]]] = OrderedDict()
+_CODE_CACHE: OrderedDict[tuple[BinaryModule, tuple[int, ...] | None, int, int], CompiledModule] = OrderedDict()
+_MODULE_LOCK = threading.RLock()
+_STATE_WORDS = 16
+_PIPELINE_CACHE_BYTES = 16 * 1024 * 1024
+_PIPELINE_CACHE_ENTRIES = 128
+
+
+def _compile_phase(active: bool) -> None:
+    """Notify the external development watchdog without executing guest code."""
+    destination = os.environ.get('WASMGPU_GUARD_STATUS')
+    if destination:
+        path = Path(destination)
+        temporary = path.with_suffix('.tmp')
+        status: dict[str, bool | float] = {'compiling': active, 'started': time.monotonic()}
+        temporary.write_text(json.dumps(status))
+        temporary.replace(path)
+
+
+@dataclass
+class CallMetrics:
+    """Wall-clock phases; execution includes dispatch and completion-state synchronization."""
+
+    codegen_seconds: float = 0.0
+    compile_seconds: float = 0.0
+    pipelines_created: int = 0
+    pipeline_cache_hits: int = 0
+    prepare_seconds: float = 0.0
+    upload_seconds: float = 0.0
+    execute_seconds: float = 0.0
+    max_dispatch_seconds: float = 0.0
+    readback_seconds: float = 0.0
+    decode_seconds: float = 0.0
+    dispatches: int = 0
+    compiled_instructions: int = 0
+    interpreted_instructions: int = 0
+    function_samples: dict[int, int] = field(default_factory=dict)
 
 
 def _words(blob: Blob) -> array[int]:
@@ -41,10 +91,10 @@ def _words(blob: Blob) -> array[int]:
     return words
 
 
-def _positive(value: int, name: str, zero: bool = False) -> int:
+def _positive(value: int, name: str, zero: bool = False, *, bits: int = 32) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f'{name} must be an integer')
-    if value < (0 if zero else 1) or value > 0xFFFFFFFF:
+    if value < (0 if zero else 1) or value >= 1 << bits:
         raise ValueError(f'{name} out of range')
     return value
 
@@ -100,8 +150,93 @@ class _Context:
             raise GPUUnavailableError(f'could not initialize a hardware GPU: {error}') from error
         constants = '\n'.join(f'const WASI_{name.upper()}: u32 = {index}u;' for name, index in WASI_IDS.items())
         source = constants + '\n' + '\n'.join((Path(__file__).parent / name).read_text() for name in ('numeric.wgsl', 'operations.wgsl', 'vm.wgsl', 'filesystem.wgsl'))
-        shader = self.device.create_shader_module(label='wasmgpu interpreter', code=source)
-        self.pipeline = self.device.create_compute_pipeline(layout='auto', compute={'module': shader, 'entry_point': 'run'})
+        self._interpreter_source = source
+        self._interpreter: Pipeline | None = None
+        self._initializer: Pipeline | None = None
+        self._services: Pipeline | None = None
+        self._compiled: OrderedDict[str, Pipeline] = OrderedDict()
+        self._compiled_sizes: dict[str, int] = {}
+        self._compiled_bytes = 0
+        self._compile_lock = threading.Lock()
+        self._constants = constants
+        self._binding_layout = self.device.create_bind_group_layout(entries=[
+            {'binding': index, 'visibility': 4, 'buffer': {'type': 'uniform' if index == 1 else 'read-only-storage' if index == 0 else 'storage'}}
+            for index in range(7)
+        ])
+        self._pipeline_layout = self.device.create_pipeline_layout(bind_group_layouts=[self._binding_layout])
+
+    @property
+    def pipeline(self) -> Pipeline:
+        with self._compile_lock:
+            if self._interpreter is None:
+                _compile_phase(True)
+                try:
+                    shader = self.device.create_shader_module(label='wasmgpu interpreter', code=self._interpreter_source)
+                    self._interpreter = self.device.create_compute_pipeline(layout=self._pipeline_layout, compute={'module': shader, 'entry_point': 'run'})
+                finally:
+                    _compile_phase(False)
+            return self._interpreter
+
+    def compiled_pipeline(self, generated: str) -> tuple[Pipeline, bool]:
+        key = hashlib.sha256(generated.encode()).hexdigest()
+        with self._compile_lock:
+            if key in self._compiled:
+                self._compiled.move_to_end(key)
+                return self._compiled[key], True
+            root = Path(__file__).parent
+            vm = vm_support()
+            filesystem = '''
+fn wasi_dispatch(syscall: u32, base: u32) -> u32 {
+    output[lane] = vec2u(syscall, base); vm.status = 5u; return 0u;
+}
+fn fs_charge(amount: u32) -> bool {
+    if !fuel_available(amount) { fail(8u); return false; }
+    consume_fuel(amount); return true;
+}'''
+            source = '\n'.join([self._constants, (root / 'numeric.wgsl').read_text(), 'struct NumericResult { value: vec2u, trap: u32 }', vm,
+                                filesystem, generated, (root / 'compiled.wgsl').read_text()])
+            _compile_phase(True)
+            try:
+                shader = self.device.create_shader_module(label='wasmgpu compiled module', code=source)
+                pipeline = self.device.create_compute_pipeline(layout=self._pipeline_layout, compute={'module': shader, 'entry_point': 'run'})
+            finally:
+                _compile_phase(False)
+            self._compiled[key] = pipeline
+            cost = len(generated.encode())
+            self._compiled_sizes[key] = cost
+            self._compiled_bytes += cost
+            while len(self._compiled) > 1 and (len(self._compiled) > _PIPELINE_CACHE_ENTRIES or self._compiled_bytes > _PIPELINE_CACHE_BYTES):
+                evicted, _ = self._compiled.popitem(last=False)
+                self._compiled_bytes -= self._compiled_sizes.pop(evicted)
+            return pipeline, False
+
+    @property
+    def services(self) -> Pipeline:
+        with self._compile_lock:
+            if self._services is None:
+                root = Path(__file__).parent
+                vm = vm_support()
+                source = '\n'.join([self._constants, (root / 'numeric.wgsl').read_text(), vm,
+                                    (root / 'filesystem.wgsl').read_text(), (root / 'services.wgsl').read_text()])
+                _compile_phase(True)
+                try:
+                    shader = self.device.create_shader_module(label='wasmgpu GPU services', code=source)
+                    self._services = self.device.create_compute_pipeline(layout=self._pipeline_layout, compute={'module': shader, 'entry_point': 'service'})
+                finally:
+                    _compile_phase(False)
+            return self._services
+
+    @property
+    def initializer(self) -> Pipeline:
+        with self._compile_lock:
+            if self._initializer is None:
+                _compile_phase(True)
+                try:
+                    shader = self.device.create_shader_module(label='wasmgpu initialization', code=Path(__file__).with_name('initialize.wgsl').read_text())
+                    self._initializer = self.device.create_compute_pipeline(layout='auto', compute={'module': shader, 'entry_point': 'initialize'})
+                finally:
+                    _compile_phase(False)
+            return self._initializer
 
     def buffer(self, size: int = 0, data: Blob | array[int] | None = None, uniform: bool = False) -> Buffer:
         flags = self.wgpu.BufferUsage
@@ -119,26 +254,28 @@ def _context() -> _Context:
         return _CONTEXT
 
 
-def _program(module: BinaryModule) -> array[int]:
+def _program(module: BinaryModule, *, bytecode: bool = True) -> array[int]:
     canonical = [module.types.index(signature) for signature in module.types]
     words = [0] * 16
     code: list[int] = []
+    offset = 0
     for fn in module.functions:
         params, results = module.types[fn.type_index]
         instructions = fn.instructions
         if fn.imported is not None:
             fn.locals = list(params)
             instructions = [[0x20, index, 0, 0] for index in range(len(params))] + [[0x10, module.functions.index(fn), 0, 0], [0x0F, 0, 0, 0]]
-        fn.offset = len(code) // 4
+        fn.offset = offset
+        offset += len(instructions)
         words.extend([fn.offset, len(params), len(results), len(fn.locals), canonical[fn.type_index], WASI_IDS[fn.imported[1]] if fn.imported else 0, 0, 0])
-        for op, operand, b, c in instructions:
+        for op, operand, b, c in instructions if bytecode else ():
             a = operand
             if 0x100 <= op <= 0x104:
                 a += fn.offset
             elif op == 0x11:
                 a = canonical[a]
             code.extend([op, a & 0xFFFFFFFF, b & 0xFFFFFFFF, c & 0xFFFFFFFF])
-    words[0] = len(words)
+    words[0] = len(words) if bytecode else 0
     words.extend(code)
     words[1] = len(words)
     words.extend([0] * (len(module.data) * 2))
@@ -151,7 +288,47 @@ def _program(module: BinaryModule) -> array[int]:
     for i, (_, elements, _, _, _) in enumerate(module.elements):
         words[words[2] + i * 2:words[2] + i * 2 + 2] = [len(words), len(elements)]
         words.extend(elements)
+    if not bytecode:
+        # Native jump tables contain continuation addresses and stack moves,
+        # never opcodes. Keeping them in data avoids enormous shader switches.
+        words[5] = len(words)
+        for function in module.functions:
+            for op, start, count, _ in function.instructions:
+                if op == BRANCH_TABLE:
+                    for _, target, height, arity in function.instructions[start:start + count]:
+                        words.extend([function.offset + target, height, arity])
     return array('I', words)
+
+
+def _load_module(data: bytes) -> tuple[BinaryModule, array[int]]:
+    with _MODULE_LOCK:
+        if data not in _MODULE_CACHE:
+            binary = BinaryModule(data)
+            Wasi.validate_imports(binary)
+            _MODULE_CACHE[data] = binary, _program(binary)
+        _MODULE_CACHE.move_to_end(data)
+        while len(_MODULE_CACHE) > 1 and (len(_MODULE_CACHE) > 4 or sum(map(len, _MODULE_CACHE)) > 64 * 1024 * 1024):
+            _, (evicted, _) = _MODULE_CACHE.popitem(last=False)
+            # Code-cache keys must not keep large evicted syntax trees alive.
+            for key in list(_CODE_CACHE):
+                if key[0] is evicted:
+                    del _CODE_CACHE[key]
+        return _MODULE_CACHE[data]
+
+
+def _compile_module(binary: BinaryModule, functions: tuple[int, ...] | None, limit: int) -> CompiledModule:
+    with _MODULE_LOCK:
+        # The older Metal backend used by Python 3.8 exhausted compiler
+        # memory on a larger single shader. Keep each of its units smaller.
+        source_limit = 16384 if sys.version_info < (3, 9) else 65536
+        key = binary, functions, limit, source_limit
+        if key not in _CODE_CACHE:
+            _CODE_CACHE[key] = compile_module(binary, functions, instruction_limit=limit, source_limit=source_limit)
+            _CODE_CACHE[key].program = _program(binary, bytecode=False)
+        _CODE_CACHE.move_to_end(key)
+        while len(_CODE_CACHE) > 16:
+            _CODE_CACHE.popitem(last=False)
+        return _CODE_CACHE[key]
 
 
 class Module:
@@ -161,17 +338,28 @@ class Module:
     runtime dependency; tests use Wasmtime's assembler.
     """
 
-    def __init__(self, source: str | os.PathLike[str] | Blob, *, files: Mapping[str, Blob] | None = None) -> None:
+    def __init__(self, source: str | os.PathLike[str] | Blob, *, files: Mapping[str, Blob] | None = None,
+                 execution: str = 'auto', compile_functions: Iterable[int] | None = None, compile_limit: int = MAX_COMPILED_INSTRUCTIONS) -> None:
+        started = time.perf_counter()
+        if execution not in ('auto', 'compiled', 'interpreter'):
+            raise ValueError('execution must be auto, compiled or interpreter')
+        _positive(compile_limit, 'compile_limit', zero=True)
         if isinstance(source, (str, os.PathLike)):
             data = Path(source).read_bytes()
         elif isinstance(source, (bytes, bytearray, memoryview)):
             data = bytes(source)
         else:
             raise TypeError('Module requires a filesystem path or WASM bytes')
-        self._binary = BinaryModule(data)
-        Wasi.validate_imports(self._binary)
-        self._program = _program(self._binary)
+        self._binary, self._program = _load_module(data)
         self._files = Wasi(files=files).files
+        self.load_seconds = time.perf_counter() - started
+        started = time.perf_counter()
+        self.execution = execution
+        selection = tuple(_positive(index, 'compiled function index', zero=True) for index in compile_functions) if compile_functions is not None else None
+        self.compiled = _compile_module(self._binary, selection, compile_limit) if execution != 'interpreter' else None
+        if self.compiled is not None:
+            self._program = self.compiled.program
+        self.codegen_seconds = time.perf_counter() - started
 
     @property
     def exports(self) -> dict[str, str]:
@@ -199,42 +387,8 @@ class _Batch:
         self.context = owner._context
         device = self.context.device
         binary = owner.module._binary
-        words = array('I', [0]) * (owner._heap_words * count)
-
-        def repeat(offset: int, value: int) -> None:
-            words[offset * count:(offset + 1) * count] = array('I', [value]) * count
-
-        for index, (_, _, value) in enumerate(binary.globals):
-            repeat(index * 2, value & 0xFFFFFFFF)
-            repeat(index * 2 + 1, value >> 32)
-        initial_memory = bytearray((binary.memory[0] if binary.memory else 0) * 65536)
-        for index, (offset, blob) in enumerate(binary.data):
-            if offset is not None:
-                if offset > len(initial_memory) or len(blob) > len(initial_memory) - offset:
-                    raise Trap({first: 'out of bounds memory access during instantiation'}, [])
-                initial_memory[offset:offset + len(blob)] = blob
-                repeat(owner._data_flags + index, 1)
-        for index, value in enumerate(_words(initial_memory)):
-            if value:
-                repeat(owner._memory_offset + index, value)
-        for index, (_, (initial_size, _)) in enumerate(binary.tables):
-            repeat(owner._table_lengths + index, initial_size)
-        for index, (offset, elements, declarative, _, table) in enumerate(binary.elements):
-            if offset is not None:
-                initial_size = binary.tables[table][1][0]
-                if offset > initial_size or len(elements) > initial_size - offset:
-                    raise Trap({first: 'out of bounds table access during instantiation'}, [])
-                for element_index, value in enumerate(elements):
-                    repeat(owner._table_offsets[table] + offset + element_index, value)
-            if offset is not None or declarative:
-                repeat(owner._element_flags + index, 1)
-        for offset, value in enumerate(owner._filesystem):
-            if value:
-                repeat(owner._fs_offset + offset, value)
-        if owner._filesystem:
-            for lane in range(count):
-                words[(owner._fs_offset + 18) * count + lane] = first + lane
         self.buffers: list[Buffer] = []
+        self.initialization_config: Buffer | None = None
         try:
             assert owner._program_buffer is not None
             self.buffers = [owner._program_buffer]
@@ -244,19 +398,24 @@ class _Batch:
                                 owner._fs_offset, owner._wasi.max_files, owner._wasi.max_fds, owner._wasi.storage_size])
             self.buffers.append(self.context.buffer(data=config, uniform=True))
             self.buffers.append(self.context.buffer(size=count * owner.stack_size * 8))
-            self.buffers.append(self.context.buffer(data=words))
+            self.buffers.append(self.context.buffer(size=owner._heap_words * count * 4))
             self.buffers.append(self.context.buffer(size=count * owner.call_depth * 16))
-            state = array('I', [0]) * (count * 12)
-            for lane in range(count):
-                state[lane * 12 + 5] = binary.memory[0] if binary.memory else 0
-                state[lane * 12 + 6] = 0
+            state = array('I', [0, 0, 0, 0, 0, binary.memory[0] if binary.memory else 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) * count
             self.buffers.append(self.context.buffer(data=state))
             self.buffers.append(self.context.buffer(size=count * owner._output_slots * 8))
             self.state = state
-            self.group = device.create_bind_group(layout=self.context.pipeline.get_bind_group_layout(0), entries=[
+            self.group = device.create_bind_group(layout=owner._pipeline.get_bind_group_layout(0), entries=[
                 {'binding': index, 'resource': {'buffer': buffer, 'offset': 0, 'size': buffer.size}}
                 for index, buffer in enumerate(self.buffers)
             ])
+            if owner._template_buffer is not None:
+                self.initialization_config = self.context.buffer(data=array('I', [count, owner._heap_words,
+                    owner._fs_offset + 18 if owner._uses_wasi else 0xffffffff, first]), uniform=True)
+                self.initialization_group = device.create_bind_group(layout=self.context.initializer.get_bind_group_layout(0), entries=[
+                    {'binding': index, 'resource': {'buffer': buffer, 'offset': 0, 'size': buffer.size}}
+                    for index, buffer in enumerate((owner._template_buffer, self.buffers[3], self.initialization_config))
+                ])
+            self.initialize_heap()
         except Exception:
             self.close()
             raise
@@ -265,48 +424,101 @@ class _Batch:
         for buffer in self.buffers[1:]:
             buffer.destroy()
         self.buffers = []
+        if self.initialization_config is not None:
+            self.initialization_config.destroy()
+            self.initialization_config = None
 
-    def execute(self, function_index: int, inputs: Sequence[tuple[int, ...]], fuel: int, raw: bool = False) -> tuple[list[Result], dict[int, str]]:
+    def initialize_heap(self) -> None:
+        if self.owner._template_buffer is None:
+            self.context.device.queue.write_buffer(self.buffers[3], 0, self.owner._initial_words)
+        else:
+            encoder = self.context.device.create_command_encoder(label='wasmgpu initialize batch')
+            compute = encoder.begin_compute_pass()
+            compute.set_pipeline(self.context.initializer)
+            compute.set_bind_group(0, self.initialization_group)
+            compute.dispatch_workgroups(min(65535, (self.count * self.owner._heap_words + 255) // 256))
+            compute.end()
+            self.context.device.queue.submit([encoder.finish()])
+
+    def execute(self, function_index: int, inputs: Sequence[tuple[int, ...]], fuel: int, raw: bool = False,  # noqa: PLR0915 - Dispatch, phase timing and decoding.
+                cancel: Callable[[], bool] | None = None) -> tuple[list[Result], dict[int, str]]:
         owner = self.owner
         device = self.context.device
         fn = owner.module._binary.functions[function_index]
         _, returns = owner.module._binary.signature(function_index)
+        metrics = owner.last_call
+        started = time.perf_counter()
         arguments = array('Q', [0]) * (self.count * max(1, len(fn.locals)))
         for lane, row in enumerate(inputs):
             for index, value in enumerate(row):
                 arguments[index * self.count + lane] = value
-            base = lane * 12
-            pages, table_len = self.state[base + 5], self.state[base + 6]
-            self.state[base:base + 12] = array('I', [fn.offset, len(fn.locals), 0, function_index, 0, pages, table_len, 0, 0, fuel, 0, 0])
+            base = lane * _STATE_WORDS
+            pages = self.state[base + 5]
+            self.state[base:base + _STATE_WORDS] = array('I', [fn.offset, len(fn.locals), 0, function_index, 0, pages, 0, 0, 0, fuel & 0xffffffff, 0, 0, fuel >> 32, 0, 0, 0])
+        metrics.prepare_seconds += time.perf_counter() - started
+        started = time.perf_counter()
         device.queue.write_buffer(self.buffers[2], 0, arguments)
         device.queue.write_buffer(self.buffers[5], 0, self.state)
+        metrics.upload_seconds += time.perf_counter() - started
+        previous_compiled = previous_interpreted = 0
+        last_region = -1
         while True:
+            if cancel is not None and cancel():
+                raise InterruptedError('GPU invocation cancelled between dispatches')
+            if any(status == 5 for status in self.state[7::_STATE_WORDS]):
+                pipeline = self.context.services
+            elif owner.module.compiled is not None:
+                plan = owner.module.compiled
+                regions = sorted({plan.region_for(self.state[base]) for base in range(0, len(self.state), _STATE_WORDS) if self.state[base + 7] == 0})
+                region = next((index for index in regions if index > last_region), regions[0])
+                pipeline = owner._native_pipeline(region, metrics)
+                last_region = region
+            else:
+                pipeline = owner._pipeline
+            if cancel is not None and cancel():
+                raise InterruptedError('GPU invocation cancelled between dispatches')
+            started = time.perf_counter()
             encoder = device.create_command_encoder(label='wasmgpu dispatch')
             compute = encoder.begin_compute_pass()
-            compute.set_pipeline(self.context.pipeline)
+            compute.set_pipeline(pipeline)
             compute.set_bind_group(0, self.group)
             compute.dispatch_workgroups((self.count + 63) // 64)
             compute.end()
             device.queue.submit([encoder.finish()])
             self.state = array('I')
             self.state.frombytes(device.queue.read_buffer(self.buffers[5]))
-            statuses = self.state[7::12]
+            elapsed = time.perf_counter() - started
+            metrics.execute_seconds += elapsed
+            metrics.max_dispatch_seconds = max(metrics.max_dispatch_seconds, elapsed)
+            metrics.dispatches += 1
+            compiled = sum(self.state[11::_STATE_WORDS]) + (sum(self.state[14::_STATE_WORDS]) << 32)
+            interpreted = sum(self.state[6::_STATE_WORDS]) + (sum(self.state[13::_STATE_WORDS]) << 32)
+            metrics.compiled_instructions += compiled - previous_compiled
+            metrics.interpreted_instructions += interpreted - previous_interpreted
+            previous_compiled, previous_interpreted = compiled, interpreted
+            for function in self.state[3::_STATE_WORDS]:
+                metrics.function_samples[function] = metrics.function_samples.get(function, 0) + 1
+            statuses = self.state[7::_STATE_WORDS]
             if all(status in (1, 2) for status in statuses):
                 break
+        started = time.perf_counter()
         output = array('Q')
         output.frombytes(device.queue.read_buffer(self.buffers[6]))
+        metrics.readback_seconds += time.perf_counter() - started
+        started = time.perf_counter()
         results: list[Result] = []
         traps: dict[int, str] = {}
         for lane in range(self.count):
-            if self.state[lane * 12 + 7] == 2:
-                code = self.state[lane * 12 + 8]
+            if self.state[lane * _STATE_WORDS + 7] == 2:
+                code = self.state[lane * _STATE_WORDS + 8]
                 if code == 12:
-                    owner.exit_codes[self.first + lane] = self.state[lane * 12 + 10]
+                    owner.exit_codes[self.first + lane] = self.state[lane * _STATE_WORDS + 10]
                 traps[self.first + lane] = _TRAPS[code]
                 results.append(None)
             else:
                 output_row = tuple(output[index * self.count + lane] if raw else _decode(output[index * self.count + lane], ty) for index, ty in enumerate(returns))
                 results.append(output_row[0] if len(output_row) == 1 else output_row if output_row else None)
+        metrics.decode_seconds += time.perf_counter() - started
         return results, traps
 
 
@@ -318,15 +530,17 @@ class Instances:
                  stack_size: int, call_depth: int, fuel: int, quantum: int, batch_size: int | None,
                  max_resident_bytes: int, wasi: Wasi | None) -> None:
         self.module = module
+        self.last_call = CallMetrics()
         self.count = _positive(count, 'count', zero=True)
         self.stack_size = _positive(stack_size, 'stack_size')
         self.call_depth = _positive(call_depth, 'call_depth')
-        self.fuel = _positive(fuel, 'fuel')
+        self.fuel = _positive(fuel, 'fuel', bits=64)
         self.quantum = _positive(quantum, 'quantum')
         self._closed = False
         self._lock = threading.RLock()
         self._batches: list[_Batch] = []
         self._program_buffer: Buffer | None = None
+        self._template_buffer: Buffer | None = None
         binary = module._binary
         initial_pages, declared_pages = binary.memory or (0, 0)
         self.memory_pages = min(declared_pages if declared_pages is not None else 65535, max(initial_pages, 16)) if memory_pages is None else _positive(memory_pages, 'memory_pages', zero=True)
@@ -355,13 +569,14 @@ class Instances:
         if not isinstance(self._wasi, Wasi):
             raise TypeError('wasi must be a Wasi configuration')
         uses_wasi = any(fn.imported is not None for fn in binary.functions) or bool(module._files) or bool(self._wasi.files)
+        self._uses_wasi = uses_wasi
         filesystem_words = 48 + self._wasi.max_files * 76 + self._wasi.max_fds * 8 + (self._wasi.storage_size + 3) // 4 if uses_wasi else 0
         self._heap_words = max(4, self._fs_offset + filesystem_words)
         self._output_slots = max([8] + [max(len(args), len(results)) for args, results in binary.types])
         for fn in binary.functions:
             if len(fn.locals) + fn.max_stack > self.stack_size:
                 raise ResourceLimitError('stack_size is smaller than a function requires')
-        per_instance = self.stack_size * 8 + self.call_depth * 16 + self._heap_words * 4 + 48 + self._output_slots * 8
+        per_instance = self.stack_size * 8 + self.call_depth * 16 + self._heap_words * 4 + _STATE_WORDS * 4 + self._output_slots * 8
         if isinstance(max_resident_bytes, bool) or not isinstance(max_resident_bytes, int):
             raise TypeError('max_resident_bytes must be an integer')
         if max_resident_bytes <= 0:
@@ -369,7 +584,7 @@ class Instances:
         budget = max_resident_bytes
         environment_strings = [*self._wasi.args, *(f'{key}={value}' for key, value in self._wasi.env.items())]
         program_bytes = 4 * (len(module._program) + len(binary.tables) * 4 + sum(2 + (len(value.encode()) + 4) // 4 for value in environment_strings))
-        self.resident_bytes = per_instance * self.count + program_bytes
+        self.resident_bytes = per_instance * self.count + program_bytes + (self._heap_words * 4 if count > 1 else 0)
         if self.resident_bytes > budget:
             raise ResourceLimitError(f'{self.count} instances require approximately {self.resident_bytes} bytes; budget is {budget}')
         if uses_wasi:
@@ -381,7 +596,7 @@ class Instances:
         limits = self._context.limits
         if program_bytes > min(limits['max-storage-buffer-binding-size'], limits['max-buffer-size']):
             raise ResourceLimitError('program and guest environment exceed the device buffer limit')
-        largest = max(self.stack_size * 8, self.call_depth * 16, self._heap_words * 4, 48, self._output_slots * 8)
+        largest = max(self.stack_size * 8, self.call_depth * 16, self._heap_words * 4, _STATE_WORDS * 4, self._output_slots * 8)
         max_batch = min(limits['max-storage-buffer-binding-size'] // largest,
                         limits['max-compute-workgroups-per-dimension'] * 64,
                         (128 * 1024 * 1024) // per_instance)
@@ -390,13 +605,28 @@ class Instances:
         self.batch_size = max_batch if batch_size is None else _positive(batch_size, 'batch_size')
         if self.batch_size > max_batch:
             raise ResourceLimitError(f'batch_size exceeds device/runtime limit {max_batch}')
-        self.resident_bytes += 64 * ((count + self.batch_size - 1) // self.batch_size)
+        self.resident_bytes += (80 if count > 1 else 64) * ((count + self.batch_size - 1) // self.batch_size)
         if self.resident_bytes > budget:
             raise ResourceLimitError('batch configuration buffers exceed the resident allocation budget')
-        self._filesystem = self._build_filesystem() if uses_wasi else array('I')
+        self.codegen_seconds = 0.0
+        started = time.perf_counter()
+        if count > 1:
+            _ = self._context.initializer
+        if module.compiled is not None:
+            if module.compiled.wasi:
+                _ = self._context.services
+            generated_at = time.perf_counter()
+            generated = module.compiled.source
+            self.codegen_seconds = time.perf_counter() - generated_at
+            self._pipeline, self.pipeline_cache_hit = self._context.compiled_pipeline(generated)
+        else:
+            self.pipeline_cache_hit = self._context._interpreter is not None
+            self._pipeline = self._context.pipeline
+        self.pipeline_seconds = time.perf_counter() - started - self.codegen_seconds
+        self._initial_words = self._build_initial_heap() if count else array('I')
         try:
             program = array('I', module._program)
-            program[12] = int(bool(self._filesystem))
+            program[12] = int(uses_wasi)
             program[4] = len(program)
             for index, (offset, capacity) in enumerate(zip(self._table_offsets, self._table_capacities)):
                 program.extend([self._table_lengths + index, offset, capacity, 0])
@@ -409,18 +639,82 @@ class Instances:
                     program[info_offset + index * 2:info_offset + index * 2 + 2] = array('I', [len(program), len(blob)])
                     program.extend(_words(blob + b'\0' * (-len(blob) % 4)))
             self._program_buffer = self._context.buffer(data=program)
+            if count > 1:
+                self._template_buffer = self._context.buffer(data=self._initial_words)
+                self._initial_words = array('I')
             for first in range(0, count, self.batch_size):
                 self._batches.append(_Batch(self, min(self.batch_size, count - first), first))
+            self._synchronize_initialization()
             if binary.start is not None:
                 self._call(binary.start, [()] * count, self.fuel)
         except Exception:
             self.close()
             raise
 
+    def _native_pipeline(self, region: int, metrics: CallMetrics) -> Pipeline:
+        assert self.module.compiled is not None
+        started = time.perf_counter()
+        source = self.module.compiled.source_for(region)
+        metrics.codegen_seconds += time.perf_counter() - started
+        started = time.perf_counter()
+        pipeline, hit = self._context.compiled_pipeline(source)
+        metrics.compile_seconds += time.perf_counter() - started
+        metrics.pipelines_created += int(not hit)
+        metrics.pipeline_cache_hits += int(hit)
+        return pipeline
+
     @property
     def adapter_info(self) -> AdapterInfo:
         assert self._context.adapter is not None
         return dict(self._context.adapter.info)
+
+    def _build_initial_heap(self) -> array[int]:
+        binary = self.module._binary
+        words = array('I', [0]) * self._heap_words
+        for index, (_, _, value) in enumerate(binary.globals):
+            words[index * 2:index * 2 + 2] = array('I', [value & 0xffffffff, value >> 32])
+        memory = bytearray((binary.memory[0] if binary.memory else 0) * 65536)
+        for index, (offset, blob) in enumerate(binary.data):
+            if offset is not None:
+                if offset > len(memory) or len(blob) > len(memory) - offset:
+                    raise Trap({0: 'out of bounds memory access during instantiation'}, [])
+                memory[offset:offset + len(blob)] = blob
+                words[self._data_flags + index] = 1
+        words[self._memory_offset:self._memory_offset + len(memory) // 4] = _words(memory)
+        for index, (_, (size, _)) in enumerate(binary.tables):
+            words[self._table_lengths + index] = size
+        for index, (offset, elements, declarative, _, table) in enumerate(binary.elements):
+            if offset is not None:
+                size = binary.tables[table][1][0]
+                if offset > size or len(elements) > size - offset:
+                    raise Trap({0: 'out of bounds table access during instantiation'}, [])
+                start = self._table_offsets[table] + offset
+                words[start:start + len(elements)] = array('I', elements)
+            if offset is not None or declarative:
+                words[self._element_flags + index] = 1
+        if self._uses_wasi:
+            filesystem = self._build_filesystem()
+            words[self._fs_offset:self._fs_offset + len(filesystem)] = filesystem
+        return words
+
+    def _synchronize_initialization(self) -> None:
+        if self._batches:
+            self._context.device.queue.read_buffer(self._batches[-1].buffers[5], 0, 4)
+
+    def reset(self) -> None:
+        """Restore fresh guest state and rerun its start function, reusing GPU buffers."""
+        with self._lock:
+            self._check_open()
+            binary = self.module._binary
+            for batch in self._batches:
+                batch.initialize_heap()
+                batch.state = array('I', [0, 0, 0, 0, 0, binary.memory[0] if binary.memory else 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) * batch.count
+                self._context.device.queue.write_buffer(batch.buffers[5], 0, batch.state)
+            self._synchronize_initialization()
+            self.exit_codes = [None] * self.count
+            self.last_call = CallMetrics()
+            if binary.start is not None:
+                self._call(binary.start, [()] * self.count, self.fuel)
 
     @property
     def stdout(self) -> list[bytes]:
@@ -462,18 +756,24 @@ class Instances:
     def _read_file_index(self, index: int, instance: int) -> bytes:
         with self._lock:
             self._check_open()
-            if not self._filesystem:
+            if not self._uses_wasi:
                 return b''
             batch, lane = self._locate(instance)
-            raw = self._context.device.queue.read_buffer(batch.buffers[3])
-            words = _words(raw)[lane::batch.count]
             entry = self._fs_offset + 48 + index * 12
-            inode = words[entry + 5]
-            entry = self._fs_offset + 48 + inode * 12
-            length, start = words[entry + 2], words[entry + 3]
+            metadata = self._read_heap(batch, lane, entry, 12)
+            inode = metadata[5]
+            if inode != index:
+                metadata = self._read_heap(batch, lane, self._fs_offset + 48 + inode * 12, 12)
+            length, start = metadata[2], metadata[3]
+            if length == 0:
+                return b''
             data_offset = self._fs_offset + 48 + self._wasi.max_files * 76 + self._wasi.max_fds * 8
-            content = array('I', words[data_offset + start // 4:data_offset + (start + length + 3) // 4]).tobytes()
+            content = self._read_heap(batch, lane, data_offset + start // 4, (start % 4 + length + 3) // 4).tobytes()
             return content[start % 4:start % 4 + length]
+
+    def _read_heap(self, batch: _Batch, lane: int, start: int, count: int) -> array[int]:
+        raw = self._context.device.queue.read_buffer(batch.buffers[3], start * batch.count * 4, count * batch.count * 4)
+        return _words(raw)[lane::batch.count]
 
     def read_file(self, path: str, *, instance: int = 0) -> bytes:
         """Read a file from one instance's GPU filesystem."""
@@ -481,12 +781,11 @@ class Instances:
             self._check_open()
             encoded_path = normalize_path(path).encode()
             batch, lane = self._locate(instance)
-            if self._filesystem:
-                raw = self._context.device.queue.read_buffer(batch.buffers[3])
-                words = _words(raw)[lane::batch.count]
-                names = self._fs_offset + 48 + self._wasi.max_files * 12
+            if self._uses_wasi:
+                words = self._read_heap(batch, lane, self._fs_offset, 48 + self._wasi.max_files * 76)
+                names = 48 + self._wasi.max_files * 12
                 for index in range(4, self._wasi.max_files):
-                    entry = self._fs_offset + 48 + index * 12
+                    entry = 48 + index * 12
                     name = array('I', words[names + index * 64:names + (index + 1) * 64]).tobytes()[:words[entry + 1]]
                     if words[entry] == 1 and name == encoded_path:
                         return self._read_file_index(index, instance)
@@ -499,7 +798,8 @@ class Instances:
         if self._closed:
             raise RuntimeError('instances are closed')
 
-    def call(self, name: str, inputs: Iterable[Row] | None = None, *, fuel: int | None = None) -> list[Result]:
+    def call(self, name: str, inputs: Iterable[Row] | None = None, *, fuel: int | None = None,
+             cancel: Callable[[], bool] | None = None) -> list[Result]:
         """Invoke one export per instance, in input order.
 
         A scalar per instance is accepted for a single argument. For multiple
@@ -508,6 +808,9 @@ class Instances:
         """
         with self._lock:
             self._check_open()
+            started = time.perf_counter()
+            if cancel is not None and not callable(cancel):
+                raise TypeError('cancel must be a callable')
             binary = self.module._binary
             if name not in binary.exports or binary.exports[name][0] != 0:
                 raise KeyError(f'no exported function {name!r}')
@@ -527,13 +830,20 @@ class Instances:
                 if not isinstance(normalized, (tuple, list)) or len(normalized) != len(params):
                     raise TypeError(f'each input row must contain {len(params)} arguments')
                 encoded.append(tuple(_encode(value, ty) for value, ty in zip(cast(Sequence[Scalar], normalized), params)))
-            return self._call(index, encoded, self.fuel if fuel is None else _positive(fuel, 'fuel'))
+            budget = self.fuel if fuel is None else _positive(fuel, 'fuel', bits=64)
+            preparation = time.perf_counter() - started
+            try:
+                return self._call(index, encoded, budget, cancel=cancel)
+            finally:
+                self.last_call.prepare_seconds += preparation
 
-    def _call(self, index: int, inputs: Sequence[tuple[int, ...]], fuel: int, raw: bool = False) -> list[Result]:
+    def _call(self, index: int, inputs: Sequence[tuple[int, ...]], fuel: int, raw: bool = False,
+              cancel: Callable[[], bool] | None = None) -> list[Result]:
+        self.last_call = CallMetrics()
         results: list[Result] = []
         traps: dict[int, str] = {}
         for batch in self._batches:
-            output, errors = batch.execute(index, inputs[batch.first:batch.first + batch.count], fuel, raw=raw)
+            output, errors = batch.execute(index, inputs[batch.first:batch.first + batch.count], fuel, raw=raw, cancel=cancel)
             results.extend(output)
             traps.update(errors)
         if traps:
@@ -554,7 +864,7 @@ class Instances:
             _positive(offset, 'offset', zero=True)
             _positive(size, 'size', zero=True)
             batch, lane = self._locate(instance)
-            length = batch.state[lane * 12 + 5] * 65536
+            length = batch.state[lane * _STATE_WORDS + 5] * 65536
             if offset > length or size > length - offset:
                 raise IndexError('memory range out of bounds')
             if size == 0:
@@ -590,6 +900,9 @@ class Instances:
                     batch.close()
                 if self._program_buffer is not None:
                     self._program_buffer.destroy()
+                if self._template_buffer is not None:
+                    self._template_buffer.destroy()
+                self._initial_words = array('I')
                 self._closed = True
 
     def __enter__(self) -> Instances:
